@@ -11,7 +11,7 @@ LB_POSITIONS = ['LB', 'ILB', 'OLB', 'MLB']
 def load_data(data_path):
     """Loads necessary CSV files."""
     print("Loading core data files...")
-
+    # Using os.path.join for platform-independent path construction
     try:
         games = pd.read_csv(os.path.join(data_path, 'games.csv'))
         plays = pd.read_csv(os.path.join(data_path, 'plays.csv'))
@@ -26,14 +26,14 @@ def load_data(data_path):
 def prepare_data(games, plays, players, pff_scouting, LB_POSITIONS):
     """Merges data and aggregates LB performance metrics."""
 
-    # 1. Base Play-by-Play Log (PBP)
+    # Base Play-by-Play Log (PBP)
     pbp_df = plays.merge(games, on='gameId', how='left')
 
-    # 2. Identify Linebackers (LBs)
+    # Identify Linebackers (LBs)
     print("Identifying Linebackers...")
     lbs = players[players['officialPosition'].isin(LB_POSITIONS)][['nflId', 'displayName']].copy()
 
-    # 3. Extract and Aggregate LB Performance
+    # Extract and Aggregate LB Performance
     print("Aggregating Linebacker performance...")
     
     pff_scouting = pff_scouting.dropna(subset=['nflId'])
@@ -46,7 +46,7 @@ def prepare_data(games, plays, players, pff_scouting, LB_POSITIONS):
         def_lb_hits=('pff_hit', 'sum')
     ).reset_index()
 
-    # 4. Final Merge & Cleanup
+    # Final Merge & Cleanup
     pbp_df = pbp_df.merge(lb_performance_agg, on=['gameId', 'playId'], how='left')
 
     # Fill NaN for plays where no LB recorded a sack, hit, or hurry (assume 0)
@@ -57,3 +57,154 @@ def prepare_data(games, plays, players, pff_scouting, LB_POSITIONS):
 
     return pbp_df, lb_pff
 
+def feature_engineer(df):
+    """Creates WPA features and the target variable."""
+    print("Engineering WPA features...")
+    
+    # Time Remaining (in seconds)
+    df['gameClock_seconds'] = df['gameClock'].apply(lambda x: int(x.split(':')[0]) * 60 + int(x.split(':')[1]))
+    df['time_remaining'] = 15 * 60 * (4 - df['quarter']) + df['gameClock_seconds']
+
+    # Score Differential (Offense perspective)
+    df['score_differential'] = np.where(
+        df['possessionTeam'] == df['homeTeamAbbr'],
+        df['preSnapHomeScore'] - df['preSnapVisitorScore'],
+        df['preSnapVisitorScore'] - df['preSnapHomeScore']
+    )
+
+    # Field Position (normalized distance to opponent's endzone)
+    df['yardline_possession'] = np.where(
+        df['yardlineSide'] == df['possessionTeam'],
+        df['yardlineNumber'],
+        100 - df['yardlineNumber']
+    )
+    df['field_pos_norm'] = df['yardline_possession'] / 100 
+
+    # Determine Final Winner (Assuming last score is the final score)
+    df['FinalHomeScore'] = df.groupby('gameId')['preSnapHomeScore'].transform('last')
+    df['FinalVisitorScore'] = df.groupby('gameId')['preSnapVisitorScore'].transform('last')
+    
+    df['winning_team'] = np.where(
+        df['FinalHomeScore'] > df['FinalVisitorScore'], df['homeTeamAbbr'],
+        np.where(df['FinalVisitorScore'] > df['FinalHomeScore'], df['visitorTeamAbbr'], 'TIE')
+    )
+    
+    # Target Variable: Did the team with possession win the game? uhmm idk
+    df['TeamInPossessionWin'] = np.where(
+        df['possessionTeam'] == df['winning_team'], 1, 0
+    )
+    
+    df = df[df['winning_team'] != 'TIE'].copy()
+    
+    return df
+
+def train_and_predict_wp(df):
+    """Trains the baseline WP model and predicts WP_Start for all plays."""
+    print("Training baseline Win Probability model...")
+
+    WP_FEATURES = ['down', 'yardsToGo', 'field_pos_norm', 'score_differential', 'time_remaining']
+
+    X = df[WP_FEATURES]
+    y = df['TeamInPossessionWin']
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.1, random_state=42)
+
+    # Train the Logistic Regression Model
+    wp_model = LogisticRegression(solver='lbfgs', max_iter=2000) 
+    wp_model.fit(X_train, y_train)
+
+    print(f"Baseline WP Model AUC Score (on test set): {roc_auc_score(y_test, wp_model.predict_proba(X_test)[:, 1]):.4f}")
+
+    # Predict WP_Start for the entire dataset
+    df['WP_Start'] = wp_model.predict_proba(df[WP_FEATURES])[:, 1]
+    
+    return df
+
+def calculate_lb_wpa(pbp_df, lb_pff):
+    """Calculates WPA for each play and attributes credit to LBs."""
+    print("Calculating Win Probability Added (WPA)...")
+
+    # 1. Calculate WP_End (WP_Start of the NEXT play)
+    pbp_df['WP_End'] = pbp_df.groupby('gameId')['WP_Start'].shift(-1)
+    
+    # Handle the last play of the game: WP_End = Final Result (1.0 or 0.0)
+    pbp_df['WP_End'] = np.where(pbp_df['WP_End'].isna(), pbp_df['TeamInPossessionWin'].astype(float), pbp_df['WP_End'])
+
+    # Handle Turnover, If possession changes, WP must be flipped (1 - WP_End)
+    possession_changed = (pbp_df.groupby('gameId')['possessionTeam'].shift(-1) != pbp_df['possessionTeam'])
+    pbp_df['WP_End'] = np.where(
+        (possession_changed) & (pbp_df['WP_End'] != 0.0) & (pbp_df['WP_End'] != 1.0),
+        1 - pbp_df['WP_End'],
+        pbp_df['WP_End']
+    )
+    
+    # Calculate WPA_Play
+    pbp_df['WPA_Play'] = pbp_df['WP_End'] - pbp_df['WP_Start']
+    
+    # Assign WPA Credit to Defensive LBs and get the defensive team
+    lb_contributions = pbp_df[
+        (pbp_df['def_lb_sacks'] > 0) | 
+        (pbp_df['def_lb_hurries'] > 0) | 
+        (pbp_df['def_lb_hits'] > 0)
+    ][['gameId', 'playId', 'WPA_Play', 'defensiveTeam', 'winning_team']].copy()
+
+    individual_lb_wpa = lb_pff.merge(lb_contributions, on=['gameId', 'playId'], how='inner')
+    
+    individual_lb_wpa['WPA_Credit'] = -individual_lb_wpa['WPA_Play']
+    
+    # Games Won
+    game_outcomes = individual_lb_wpa[['nflId', 'displayName', 'gameId', 'defensiveTeam', 'winning_team']].drop_duplicates()
+    game_outcomes['is_win'] = (game_outcomes['defensiveTeam'] == game_outcomes['winning_team']).astype(int)
+    
+    wins_per_player = game_outcomes.groupby(['nflId', 'displayName', 'defensiveTeam'])['is_win'].sum().reset_index()
+    wins_per_player = wins_per_player.rename(columns={'is_win': 'Games_Won'})
+
+    # Calculate Final Cumulative LB WPA
+    final_lb_wpa = individual_lb_wpa.groupby(['nflId', 'displayName', 'defensiveTeam']).agg(
+        Total_WPA_Contribution=('WPA_Credit', 'sum'),
+        Total_Plays_Contributed=('playId', 'count'),
+        Game_Count=('gameId', pd.Series.nunique)
+    ).reset_index()
+    
+    final_lb_wpa = final_lb_wpa.merge(wins_per_player, on=['nflId', 'displayName', 'defensiveTeam'], how='left')
+    
+    # Calculate WPA per Play 
+    final_lb_wpa['WPA_Per_Play'] = final_lb_wpa['Total_WPA_Contribution'] / final_lb_wpa['Total_Plays_Contributed']
+
+    final_lb_wpa['Win_Rate'] = final_lb_wpa['Games_Won'] / final_lb_wpa['Game_Count'] # <-- NEW LINE
+
+    final_lb_wpa = final_lb_wpa.sort_values(by='Total_WPA_Contribution', ascending=False)
+    
+    return final_lb_wpa
+
+
+# Run
+if __name__ == '__main__':
+    # Ensure numpy :3
+    np.set_printoptions(suppress=True)
+    pd.set_option('display.float_format', lambda x: '%.4f' % x)
+    
+    try:
+        # Data Preparation
+        games, plays, players, pff_scouting = load_data(DATA_PATH)
+        pbp_df, lb_pff = prepare_data(games, plays, players, pff_scouting, LB_POSITIONS)
+        
+        # Feature Engineering and WP Modeling
+        pbp_df = feature_engineer(pbp_df)
+        pbp_df = train_and_predict_wp(pbp_df)
+        
+        # WPA Calculation and Attribution
+        final_lb_wpa = calculate_lb_wpa(pbp_df, lb_pff)
+
+        print("\n" + "="*50)
+        print("TOP 10 LINEBACKERS BY TOTAL WPA CONTRIBUTION")
+        print("Total WPA is measured in probability of winning.")
+        print("="*50)
+        print(final_lb_wpa.head(10))
+        print("\nAnalysis Complete.")
+
+    except FileNotFoundError as e:
+        # This catch is essential if a data file is missing
+        print(f"\nERROR: One or more data files not found. Check your DATA_PATH configuration: {e}")
+    except Exception as e:
+        print(f"\nAn unexpected error occurred during execution: {e}")
