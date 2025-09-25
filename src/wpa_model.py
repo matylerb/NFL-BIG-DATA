@@ -5,8 +5,10 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score
 
+# --- CONFIGURATION (Ensure these are defined globally at the start of your script) ---
 DATA_PATH = 'dataset/' 
 LB_POSITIONS = ['LB', 'ILB', 'OLB', 'MLB'] 
+
 
 def load_data(data_path):
     """Loads necessary CSV files."""
@@ -89,7 +91,7 @@ def feature_engineer(df):
         np.where(df['FinalVisitorScore'] > df['FinalHomeScore'], df['visitorTeamAbbr'], 'TIE')
     )
     
-    # Target Variable: Did the team with possession win the game? uhmm idk
+    # Target Variable: Did the team with possession win the game?
     df['TeamInPossessionWin'] = np.where(
         df['possessionTeam'] == df['winning_team'], 1, 0
     )
@@ -130,7 +132,7 @@ def calculate_lb_wpa(pbp_df, lb_pff):
     # Handle the last play of the game: WP_End = Final Result (1.0 or 0.0)
     pbp_df['WP_End'] = np.where(pbp_df['WP_End'].isna(), pbp_df['TeamInPossessionWin'].astype(float), pbp_df['WP_End'])
 
-    # Handle Turnover, If possession changes, WP must be flipped (1 - WP_End)
+    # Handle Turnover: If possession changes, WP must be flipped (1 - WP_End)
     possession_changed = (pbp_df.groupby('gameId')['possessionTeam'].shift(-1) != pbp_df['possessionTeam'])
     pbp_df['WP_End'] = np.where(
         (possession_changed) & (pbp_df['WP_End'] != 0.0) & (pbp_df['WP_End'] != 1.0),
@@ -138,15 +140,15 @@ def calculate_lb_wpa(pbp_df, lb_pff):
         pbp_df['WP_End']
     )
     
-    # Calculate WPA_Play
+    # 2. Calculate WPA_Play
     pbp_df['WPA_Play'] = pbp_df['WP_End'] - pbp_df['WP_Start']
     
-    # Assign WPA Credit to Defensive LBs and get the defensive team
+    # 3. Assign WPA Credit to Defensive LBs and get the defensive team
     lb_contributions = pbp_df[
         (pbp_df['def_lb_sacks'] > 0) | 
         (pbp_df['def_lb_hurries'] > 0) | 
         (pbp_df['def_lb_hits'] > 0)
-    ][['gameId', 'playId', 'WPA_Play', 'defensiveTeam', 'winning_team']].copy()
+    ][['gameId', 'playId', 'WPA_Play', 'defensiveTeam', 'winning_team', 'def_lb_sacks', 'def_lb_hurries', 'def_lb_hits']].copy()
 
     individual_lb_wpa = lb_pff.merge(lb_contributions, on=['gameId', 'playId'], how='inner')
     
@@ -159,41 +161,60 @@ def calculate_lb_wpa(pbp_df, lb_pff):
     wins_per_player = game_outcomes.groupby(['nflId', 'displayName', 'defensiveTeam'])['is_win'].sum().reset_index()
     wins_per_player = wins_per_player.rename(columns={'is_win': 'Games_Won'})
 
-    # Calculate Final Cumulative LB WPA
+    # 4. Calculate Final Cumulative LB WPA (Player Evaluation Metric)
     final_lb_wpa = individual_lb_wpa.groupby(['nflId', 'displayName', 'defensiveTeam']).agg(
         Total_WPA_Contribution=('WPA_Credit', 'sum'),
         Total_Plays_Contributed=('playId', 'count'),
+        Sacks_Count=('def_lb_sacks', 'sum'),
+        Hurries_Count=('def_lb_hurries', 'sum'),
+        Hits_Count=('def_lb_hits', 'sum'),
         Game_Count=('gameId', pd.Series.nunique)
     ).reset_index()
     
     final_lb_wpa = final_lb_wpa.merge(wins_per_player, on=['nflId', 'displayName', 'defensiveTeam'], how='left')
     
-    # Calculate WPA per Play 
+    # Calculate WPA per Play (Efficiency Metric)
     final_lb_wpa['WPA_Per_Play'] = final_lb_wpa['Total_WPA_Contribution'] / final_lb_wpa['Total_Plays_Contributed']
-
-    final_lb_wpa['Win_Rate'] = final_lb_wpa['Games_Won'] / final_lb_wpa['Game_Count'] # <-- NEW LINE
+    final_lb_wpa['Win_Rate'] = final_lb_wpa['Games_Won'] / final_lb_wpa['Game_Count']
 
     final_lb_wpa = final_lb_wpa.sort_values(by='Total_WPA_Contribution', ascending=False)
     
     return final_lb_wpa
 
+# --- NEW FUNCTION TO SAVE RESULTS ---
+def save_results_to_csv(df, filename='top_100_linebackers.csv', num_rows=100):
+    """
+    Saves the top N rows of the dataframe to a CSV file.
+    
+    Args:
+        df (pd.DataFrame): The dataframe containing the final results.
+        filename (str): The name of the CSV file to save.
+        num_rows (int): The number of top rows to save.
+    """
+    if not os.path.exists('output'):
+        os.makedirs('output')
+    
+    output_df = df.head(num_rows)
+    output_path = os.path.join('output', filename)
+    
+    output_df.to_csv(output_path, index=False)
+    print(f"\nSuccessfully saved top {num_rows} linebackers to '{output_path}'")
 
-# Run
 if __name__ == '__main__':
-    # Ensure numpy :3
+    # Ensure numpy settings for better display
     np.set_printoptions(suppress=True)
     pd.set_option('display.float_format', lambda x: '%.4f' % x)
     
     try:
-        # Data Preparation
+        # Phase 1: Data Preparation
         games, plays, players, pff_scouting = load_data(DATA_PATH)
         pbp_df, lb_pff = prepare_data(games, plays, players, pff_scouting, LB_POSITIONS)
         
-        # Feature Engineering and WP Modeling
+        # Phase 2: Feature Engineering and WP Modeling
         pbp_df = feature_engineer(pbp_df)
         pbp_df = train_and_predict_wp(pbp_df)
         
-        # WPA Calculation and Attribution
+        # Phase 3: WPA Calculation and Attribution
         final_lb_wpa = calculate_lb_wpa(pbp_df, lb_pff)
 
         print("\n" + "="*50)
@@ -201,10 +222,13 @@ if __name__ == '__main__':
         print("Total WPA is measured in probability of winning.")
         print("="*50)
         print(final_lb_wpa.head(10))
+        
+        # --- NEW CALL: Save the results to a CSV file
+        save_results_to_csv(final_lb_wpa)
+
         print("\nAnalysis Complete.")
 
     except FileNotFoundError as e:
-        # This catch is essential if a data file is missing
         print(f"\nERROR: One or more data files not found. Check your DATA_PATH configuration: {e}")
     except Exception as e:
         print(f"\nAn unexpected error occurred during execution: {e}")
