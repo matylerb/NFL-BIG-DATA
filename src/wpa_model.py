@@ -5,7 +5,6 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score
 
-# --- CONFIGURATION (Ensure these are defined globally at the start of your script) ---
 DATA_PATH = 'dataset/' 
 LB_POSITIONS = ['LB', 'ILB', 'OLB', 'MLB'] 
 
