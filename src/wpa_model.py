@@ -23,6 +23,8 @@ def load_data(data_path):
         
     return games, plays, players, pff_scouting
 
+# phase 1
+
 def prepare_data(games, plays, players, pff_scouting, LB_POSITIONS):
     """Merges data and aggregates LB performance metrics."""
 
@@ -57,6 +59,7 @@ def prepare_data(games, plays, players, pff_scouting, LB_POSITIONS):
 
     return pbp_df, lb_pff
 
+# phase 2
 def feature_engineer(df):
     """Creates WPA features and the target variable."""
     print("Engineering WPA features...")
@@ -119,7 +122,7 @@ def train_and_predict_wp(df):
     df['WP_Start'] = wp_model.predict_proba(df[WP_FEATURES])[:, 1]
     
     return df
-
+# phase 3
 def calculate_lb_wpa(pbp_df, lb_pff):
     """Calculates WPA for each play and attributes credit to LBs."""
     print("Calculating Win Probability Added (WPA)...")
