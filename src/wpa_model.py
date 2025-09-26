@@ -8,7 +8,6 @@ from sklearn.metrics import roc_auc_score
 DATA_PATH = 'dataset/' 
 LB_POSITIONS = ['LB', 'ILB', 'OLB', 'MLB'] 
 
-
 def load_data(data_path):
     """Loads necessary CSV files."""
     print("Loading core data files...")
@@ -180,7 +179,7 @@ def calculate_lb_wpa(pbp_df, lb_pff):
     
     return final_lb_wpa
 
-# --- NEW FUNCTION TO SAVE RESULTS ---
+#Save results
 def save_results_to_csv(df, filename='top_100_linebackers.csv', num_rows=100):
     """
     Saves the top N rows of the dataframe to a CSV file.
